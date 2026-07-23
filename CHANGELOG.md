@@ -2,6 +2,50 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.1] - 2026-07-23
+
+### Fixed
+
+- **Model alias resolver uses runtime discovery, not hardcoded pins.**
+  The hardcoded `MODEL_ALIASES` table (pinned to `gpt-5.4-mini` and
+  `gpt-5.5`) is gone. The extension now shells out to
+  `codex debug models --bundled` once at load, parses each slug into a
+  family + version, and resolves aliases by picking the highest version
+  of the named family. `full` and `gpt` now auto-track the current
+  flagship (`gpt-5.6-sol` and whatever ships next) instead of going stale
+  on every new release. Discovery failure is non-fatal: exact slugs the
+  user types still pass through to codex verbatim.
+- **Pinned syntax (`5.4 mini`, `5.6 main`) actually resolves.** Previously
+  the family parser used exact-equality, so `"5.4 mini"` fell through to
+  passthrough even though the tool description promised it worked. Family
+  parsing now uses word-boundary regex (`\b(mini|nano)\b`, `\bcodex\b`,
+  `\bpro\b`, `\b(full|gpt)\b`) with specific families checked before the
+  generic `gpt` keyword so `gpt-...-mini` doesn't false-match the `gpt`
+  family.
+- **Flagship selection is deterministic.** Within the same version,
+  entries now tiebreak by variant priority (`sol > plain > terra > luna`)
+  instead of depending on the order `codex debug models --bundled`
+  happened to return. Same priority applies to pinned-version resolution.
+- **Leading-dash values passed as `model` are rejected before reaching
+  argv.** A value like `--dangerously-bypass-approvals-and-sandbox` used
+  to land verbatim as the `-m` token; the tool now refuses it with a
+  clear error message, matching the `SESSION_ID_RE` threat model already
+  applied to session ids.
+
+### Changed
+
+- Extension load runs `codexAvailable` and `discoverCodexModels` in
+  parallel via `Promise.all`, cutting worst-case startup from 16s to 8s
+  (each probe carries its own 8s watchdog).
+- `resolveModel` returns `{ flagValue }` only; the unused `exact` field
+  is gone (it was also mislabelled on passthrough branches).
+- `classifySlug` no longer matches the `chat-latest` / `instant`
+  suffixes — those don't appear in the `--bundled` catalog, so the branch
+  was dead. A comment now notes that compound suffixes
+  (`gpt-X.Y-mini-pro`-style) would also fall to `other` if OpenAI ever
+  introduces them.
+- Removed the unreferenced `STATUS_TAIL_CHARS` constant.
+
 ## [1.0.0] - 2026-07-07
 
 Initial release.

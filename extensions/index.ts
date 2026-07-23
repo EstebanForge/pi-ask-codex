@@ -6,11 +6,15 @@
  * stream for structured progress + the final agent message, and returns it.
  * Codex runs its OWN tool loop (read, write, edit, exec) inside the workspace.
  *
- * Model aliases: friendly names resolve to exact `--model` strings.
- *   "default" -> omit --model (Codex's own default, currently gpt-5.5)
- *   "mini"    -> gpt-5.4-mini (fast/cheap)
- *   "full"    -> gpt-5.5
- *   "gpt-5.4-mini" / "gpt-5.5" -> exact passthrough
+ * Model aliases: friendly names resolve to whatever Codex currently advertises
+ * via `codex debug models --bundled`. No version strings are hardcoded — the
+ * catalog is fetched once at extension load and the highest version wins.
+ *   "default"        -> omit --model (Codex's own default)
+ *   "mini" / "nano"  -> highest-version mini family
+ *   "full" / "gpt"   -> highest-version main family
+ *   "5.6 mini"       -> pinned version + family
+ *   "gpt-5.4-mini"   -> exact passthrough (verifies against catalog; falls
+ *                       through to codex verbatim if discovery is unavailable)
  *
  * Config: ~/.pi/agent/ask-codex.json (global) merged over
  *         .pi/ask-codex.json (project). Editable via /codex.
@@ -42,7 +46,6 @@ import { Type } from "typebox";
 const DEFAULT_TIMEOUT_MIN = 10;
 const GRACE_AFTER_TIMEOUT_MS = 5000;
 const STATUS_INTERVAL_MS = 1000;
-const STATUS_TAIL_CHARS = 200;
 const DISCOVERY_TIMEOUT_MS = 8_000;
 const GLOBAL_CONFIG_PATH = path.join(os.homedir(), ".pi", "agent", "ask-codex.json");
 
@@ -178,30 +181,214 @@ function saveConfig(patch: Partial<Config>): SaveResult {
 	return { path: targetPath, routedToProject: projectShadows };
 }
 
-// --- Model alias resolution ------------------------------------------------
+// --- Model discovery + alias resolution ------------------------------------
 
-// Friendly aliases → exact --model strings. Only models known to work on
-// ChatGPT-account auth (the common case) are mapped; arbitrary strings pass
-// through verbatim so users can target API-key-only models if authenticated.
-const MODEL_ALIASES: Record<string, string | undefined> = {
-	default: "", // omit --model entirely
-	mini: "gpt-5.4-mini",
-	"4-mini": "gpt-5.4-mini",
-	"5.4-mini": "gpt-5.4-mini",
-	full: "gpt-5.5",
-	"5.5": "gpt-5.5",
-	gpt: "gpt-5.5", // generic "gpt" -> current default full model
+// Codex slug taxonomy (verified against `codex debug models --bundled`):
+//   gpt-X.Y           -> "main" family (flagship / balanced)
+//   gpt-X.Y-mini      -> "mini" family (fast / cheap)
+//   gpt-X.Y-nano      -> "mini" family (smaller / cheaper)
+//   gpt-X.Y-pro       -> "pro" family (deep reasoning)
+//   gpt-X.Y-codex     -> "codex" family (legacy coding-tuned naming)
+//   gpt-X.Y-{sol,terra,luna} -> "main" family variants (current GPT-5.6 naming)
+// Anything else (e.g. "codex-auto-review") is excluded from resolution.
+type Family = "main" | "mini" | "pro" | "codex" | "other";
+
+interface CodexModelEntry {
+	full: string; // exact slug, e.g. "gpt-5.6-sol"
+	family: Family;
+	version: string | null; // "5.6" or null if unparseable
+}
+
+/** Descending numeric version compare. "5.10" > "5.9" (lexical sort would
+ *  wrongly rank "5.9" higher because '9' > '1'). */
+function compareVersionsDesc(a: string, b: string): number {
+	const pa = a.split(".").map(Number);
+	const pb = b.split(".").map(Number);
+	for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+		const da = pa[i] ?? 0;
+		const db = pb[i] ?? 0;
+		if (da !== db) return db - da; // descending
+	}
+	return 0;
+}
+
+/** Map one `codex debug models --bundled` slug to a (family, version) pair.
+ *  Unknown shapes (e.g. "codex-auto-review") land in "other" and are
+ *  excluded from alias resolution but still valid as exact --model args.
+ *
+ *  NOTE: the regex captures the suffix as a single token. Compound variants
+ *  like `gpt-5.6-mini-pro` are not handled — they fall to "other" and remain
+ *  exact-only. If OpenAI introduces compound naming, extend the literal
+ *  suffix checks below rather than the regex. */
+function classifySlug(slug: string): { family: Family; version: string | null } {
+	const m = slug.match(/^gpt-(\d+(?:\.\d+)?)(?:-(.+))?$/i);
+	if (!m) return { family: "other", version: null };
+	const version = m[1];
+	const suffix = m[2];
+	if (!suffix) return { family: "main", version };
+	const lower = suffix.toLowerCase();
+	if (lower === "mini" || lower === "nano") return { family: "mini", version };
+	if (lower === "pro") return { family: "pro", version };
+	if (lower === "codex" || lower.startsWith("codex-")) return { family: "codex", version };
+	// GPT-5.6 variant naming (sol/terra/luna) is main-family. sol is the
+	// flagship, terra balanced, luna fast — distinguished in resolveModel
+	// via MAIN_VARIANT_PRIORITY so ties break deterministically.
+	if (lower === "sol" || lower === "terra" || lower === "luna") return { family: "main", version };
+	return { family: "other", version };
+}
+
+/** Tiebreak priority within the main family at the same version.
+ *  sol (flagship) > plain gpt-X.Y (legacy naming) > terra (balanced) >
+ *  luna (fast) > anything else. Catalog JSON order from
+ *  `codex debug models --bundled` is not part of the contract, so an
+ *  explicit priority is required for deterministic flagship selection. */
+const MAIN_VARIANT_PRIORITY: Record<string, number> = {
+	sol: 0,
+	"": 1, // plain gpt-X.Y (no suffix)
+	terra: 2,
+	luna: 3,
 };
+function mainVariantRank(slug: string): number {
+	const m = slug.match(/^gpt-\d+(?:\.\d+)?(?:-(.+))?$/i);
+	if (!m) return 99;
+	const suffix = (m[1] ?? "").toLowerCase();
+	return MAIN_VARIANT_PRIORITY[suffix] ?? 99;
+}
 
-/** Resolve a friendly alias to a literal --model value, or null to omit
- *  --model (Codex's own default). Returns the input unchanged if no alias
- *  matches (lets exact model ids pass through). */
-function resolveModel(input: string): { flagValue: string | null; exact: boolean } {
+/** Pull the raw model catalog via `codex debug models --bundled` and parse
+ *  it into structured entries. Returns [] on any failure (non-fatal): the
+ *  caller falls back to passthrough so exact slugs typed by the user still
+ *  reach codex verbatim. */
+async function discoverCodexModels(binary: string): Promise<CodexModelEntry[]> {
+	let text = "";
+	try {
+		text = await new Promise<string>((resolve, reject) => {
+			const proc = spawn(binary, ["debug", "models", "--bundled"], {
+				stdio: ["ignore", "pipe", "ignore"],
+				shell: false,
+			});
+			proc.stdout?.setEncoding("utf8");
+			let out = "";
+			let done = false;
+			const finish = (v: string) => {
+				if (done) return;
+				done = true;
+				clearTimeout(watchdog);
+				resolve(v);
+			};
+			proc.stdout?.on("data", (d: string) => (out += d));
+			proc.on("error", (err) => {
+				clearTimeout(watchdog);
+				reject(err);
+			});
+			proc.on("close", (code) => finish(code === 0 ? out : ""));
+			const watchdog = setTimeout(() => {
+				try {
+					proc.kill("SIGKILL");
+				} catch {}
+				finish("");
+			}, DISCOVERY_TIMEOUT_MS);
+		});
+	} catch {
+		return [];
+	}
+	if (!text.trim()) return [];
+
+	// Each entry carries a large `base_instructions` blob (~50KB). Parse the
+	// whole thing but read only the fields we need; entries are huge but
+	// JSON.parse handles multi-MB fine.
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(text);
+	} catch {
+		return [];
+	}
+	const models = (parsed as { models?: unknown }).models;
+	if (!Array.isArray(models)) return [];
+
+	const entries: CodexModelEntry[] = [];
+	for (const m of models) {
+		const slug = (m as { slug?: unknown }).slug;
+		if (typeof slug !== "string" || !slug) continue;
+		const { family, version } = classifySlug(slug);
+		entries.push({ full: slug, family, version });
+	}
+	return entries;
+}
+
+/** Resolve a friendly alias / partial name to an exact --model value. Mirrors
+ *  the antigravity ext's version-sort pattern: aliases pick the highest
+ *  version of the named family; pinned versions (e.g. "5.6 mini") select a
+ *  specific version. Exact slugs pass through. Returns null to omit --model
+ *  entirely (Codex's own default). */
+function resolveModel(
+	input: string,
+	entries: CodexModelEntry[],
+): { flagValue: string | null } {
 	const lower = input.toLowerCase().trim();
-	if (lower === "default" || lower === "") return { flagValue: null, exact: false };
-	const mapped = MODEL_ALIASES[lower];
-	if (mapped !== undefined) return { flagValue: mapped || null, exact: false };
-	return { flagValue: input, exact: true };
+	if (lower === "default" || lower === "") return { flagValue: null };
+
+	// 1. Exact slug match against the live catalog.
+	const exact = entries.find((e) => e.full.toLowerCase() === lower);
+	if (exact) return { flagValue: exact.full };
+
+	// 2. Parse the alias into family + optional version. Match the family
+	//    keyword as a standalone token (\b) so pinned forms like "5.6 mini"
+//    / "5.4 full" resolve, but compound slugs that happen to contain
+	//    "gpt" or "pro" don't false-match. The exact-slug match above runs
+	//    first, so a full slug like "gpt-5.4-mini" never reaches this
+	//    branch as a family parse. Check specific families (mini/codex/pro)
+//    before the generic "full" / "gpt" so a "gpt-...-mini" intent routes
+//    to mini.
+	let family: Family | null = null;
+	if (/\b(mini|nano)\b/.test(lower)) family = "mini";
+	else if (/\bcodex\b/.test(lower)) family = "codex";
+	else if (/\bpro\b/.test(lower)) family = "pro";
+	else if (/\b(full|gpt)\b/.test(lower)) family = "main";
+
+	// Unknown alias (e.g. a bare version like "5.6") or unparseable input —
+	// passthrough to codex and let it decide. Exact user-typed slugs and
+	// API-key-only model ids keep working this way even when discovery fails.
+	if (family === null) return { flagValue: input };
+
+	const versionMatch = lower.match(/(\d+(?:\.\d+)?)/);
+	const pinnedVersion = versionMatch ? versionMatch[1] : null;
+
+	// 3. Filter by family.
+	let candidates = entries.filter((e) => e.family === family);
+	if (candidates.length === 0) {
+		// Family not in the catalog (e.g. no pro models this release) —
+		// passthrough rather than fabricating.
+		return { flagValue: input };
+	}
+
+	// 4. Pin version if specified; otherwise pick the highest version
+	//    (numeric compare, not lexical — see compareVersionsDesc). Within a
+	//    version tie, break by family-specific variant priority so flagship
+	//    selection is deterministic regardless of catalog array order.
+	if (pinnedVersion) {
+		const versioned = candidates.filter((e) => e.version === pinnedVersion);
+		if (versioned.length === 0) {
+			// Pinned version not present in catalog — passthrough so the user's
+			// explicit choice reaches codex even if the version is stale.
+			return { flagValue: input };
+		}
+		versioned.sort((a, b) => mainVariantRank(a.full) - mainVariantRank(b.full));
+		return { flagValue: versioned[0].full };
+	}
+	const versions = candidates
+		.map((e) => e.version)
+		.filter((v): v is string => v !== null);
+	if (versions.length === 0) {
+		candidates.sort((a, b) => mainVariantRank(a.full) - mainVariantRank(b.full));
+		return { flagValue: candidates[0].full };
+	}
+	const uniqueVersions = [...new Set(versions)].sort(compareVersionsDesc);
+	const top = uniqueVersions[0];
+	const topCandidates = candidates
+		.filter((e) => e.version === top)
+		.sort((a, b) => mainVariantRank(a.full) - mainVariantRank(b.full));
+	return { flagValue: topCandidates[0].full };
 }
 
 // --- Status rendering (the useful ideas borrowed from pi-codex) -------------
@@ -360,7 +547,13 @@ function emptyDetails(model: string | null, resolvedModel: string | null): Codex
 
 export default async function (pi: ExtensionAPI) {
 	const binary = resolveCodex();
-	const available = await codexAvailable(binary).catch(() => false);
+	// Run both discovery probes in parallel: each carries its own 8s
+	// watchdog, so worst-case load time is 8s instead of 16s. Either
+	// failure is non-fatal (the other still completes).
+	const [available, discovered] = await Promise.all([
+		codexAvailable(binary).catch(() => false),
+		discoverCodexModels(binary).catch(() => []),
+	]);
 
 	// --- /codex: view / change defaults -----------------------------------
 
@@ -380,6 +573,8 @@ export default async function (pi: ExtensionAPI) {
 						`AskCodex config`,
 						`  codex available:  ${available ? "yes" : "NO (check PATH / CODEX_BIN)"}`,
 						`  defaultModel:     ${config.defaultModel}`,
+						`  resolved:         ${resolveModel(config.defaultModel, discovered).flagValue ?? "(codex default)"}`,
+						`  catalog:          ${discovered.length} model(s) discovered`,
 						`  defaultReasoning: ${config.defaultReasoning}`,
 						`  defaultSandbox:   ${config.defaultSandbox}`,
 						``,
@@ -395,7 +590,7 @@ export default async function (pi: ExtensionAPI) {
 					id: "defaultModel",
 					label: "Default model",
 					description:
-						"Friendly alias resolved to an exact codex --model string. 'default' = omit the flag (Codex's own default); 'mini' = gpt-5.4-mini (fast/cheap); 'full' = gpt-5.5.",
+						"Friendly alias resolved at runtime via `codex debug models --bundled`. 'default' = omit the flag (Codex's own default); 'mini' = highest-version mini family; 'full' = highest-version main family. No version strings are hardcoded — pick whichever is current.",
 					currentValue: config.defaultModel,
 					values: MODEL_OPTIONS,
 				},
@@ -474,14 +669,14 @@ export default async function (pi: ExtensionAPI) {
 
 	// --- Tool registration -------------------------------------------------
 
-	// Free string, not a StringEnum: the alias map resolves known names
-	// (default/mini/full/gpt) but arbitrary exact ids are passed through so
-	// API-key-authenticated users can target any model codex supports. A
+	// Free string, not a StringEnum: aliases (default/mini/full/gpt/nano/pro/codex)
+	// resolve via the catalog at load, but arbitrary exact slugs still pass through
+	// so API-key-authenticated users can target any model codex supports. A
 	// bounded enum would make that passthrough branch dead code.
 	const modelParam = Type.Optional(
 		Type.String({
 			description:
-				"Model alias or exact id. Friendly: 'default' (omit flag), 'mini' (gpt-5.4-mini, fast/cheap), 'full' (gpt-5.5). Exact ids pass through verbatim (e.g. 'gpt-5.5', or any model your auth allows). Omit for the configured default.",
+				"Model alias or exact id. Friendly: 'default' (omit flag, codex picks), 'mini' (highest-version mini family), 'full' / 'gpt' (highest-version main family). Pin a version: '5.6 mini', '5.4 full'. Exact slugs pass through verbatim (e.g. 'gpt-5.6-sol', or any model your auth allows). Omit for the configured default.",
 		}),
 	);
 
@@ -557,7 +752,22 @@ export default async function (pi: ExtensionAPI) {
 
 			const config = loadConfig();
 			const requestedModel = (params.model as string | undefined) ?? config.defaultModel;
-			const resolved = resolveModel(requestedModel);
+			// Defensive: reject leading-dash model values that could misbind
+			// on codex's arg parser when spliced as the `-m` value. Same
+			// threat model as SESSION_ID_RE — a leading-dash value can't be a
+			// model id, so refuse it instead of letting it reach argv.
+			if (typeof params.model === "string" && params.model.trim().startsWith("-")) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `model value "${params.model}" starts with "-" — not a valid model id. Use a friendly alias (e.g. "full", "mini", "gpt") or a known slug (e.g. "gpt-5.5").`,
+						},
+					],
+					details: emptyDetails(requestedModel, null),
+				};
+			}
+			const resolved = resolveModel(requestedModel, discovered);
 			const reasoning = isReasoningEffort(params.reasoningEffort)
 				? params.reasoningEffort
 				: config.defaultReasoning;
