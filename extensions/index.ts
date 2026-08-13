@@ -34,10 +34,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	buildSessionContext,
+	getAgentDir,
 	getSettingsListTheme,
+	keyHint,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-import { StringEnum } from "@earendil-works/pi-ai";
+import { StringEnum, contentText } from "@earendil-works/pi-ai";
 import { Container, SettingsList, Text, type SettingItem } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
@@ -48,6 +51,10 @@ const GRACE_AFTER_TIMEOUT_MS = 5000;
 const STATUS_INTERVAL_MS = 1000;
 const DISCOVERY_TIMEOUT_MS = 8_000;
 const GLOBAL_CONFIG_PATH = path.join(os.homedir(), ".pi", "agent", "ask-codex.json");
+
+// renderCall / renderResult preview limits (match pi-claude-bridge).
+const PREVIEW_MAX_CHARS = 1000;
+const PREVIEW_MAX_LINES = 6;
 
 const DEFAULT_MODEL = "default";
 const DEFAULT_REASONING = "medium";
@@ -517,12 +524,81 @@ async function codexAvailable(binary: string): Promise<boolean> {
 	}
 }
 
+// --- Full-context export (opt-in includeContext) --------------------------
+// NOTE: duplicated per pi-ask-* package (each is self-contained). Duck-typed
+// over role/content to tolerate AgentMessage's union + custom message types.
+
+// Tool-call inputs and tool-result bodies are clamped so the exported
+// transcript stays reviewable; the agent can re-read any source file by path.
+// User/assistant prose is kept in full (that IS the conversation).
+const CONTEXT_BLOCK_MAX_CHARS = 2000;
+
+function clampBlock(text: unknown, limit = CONTEXT_BLOCK_MAX_CHARS): string {
+	const t = String(text ?? "");
+	return t.length > limit ? `${t.slice(0, limit)}\n…[truncated, ${t.length - limit} more chars]` : t;
+}
+
+/** Render resolved pi AgentMessages to a readable markdown transcript.
+ *  Pure: no IO. Caller writes the returned string to a temp file. */
+export function renderAgentMessagesMarkdown(messages: readonly unknown[]): string {
+	const lines: string[] = [
+		"# Pi conversation context",
+		"",
+		`_Exported for full-context delegation. ${messages.length} message(s)._`,
+		"",
+	];
+	for (const raw of messages) {
+		const m = raw as { role?: string; content?: unknown };
+		const role = m.role ?? "message";
+		const content = m.content;
+		if (role === "assistant") {
+			const blocks = (Array.isArray(content) ? content : []) as ReadonlyArray<{
+				type: string;
+				text?: string;
+				name?: string;
+				input?: unknown;
+			}>;
+			const text = blocks
+				.filter((b) => b.type === "text")
+				.map((b) => b.text ?? "")
+				.join("\n");
+			if (text.trim()) lines.push("## Assistant", "", text, "");
+			for (const b of blocks) {
+				if (b.type === "toolCall" || b.type === "tool_use") {
+					const input = clampBlock(
+						typeof b.input === "string" ? b.input : JSON.stringify(b.input ?? ""),
+						500,
+					);
+					lines.push(`> tool call: ${b.name ?? "(unknown)"}(${input})`, "");
+				}
+			}
+		} else if (role === "toolResult" || role === "tool_result" || role === "tool") {
+			const text = contentText(content as any);
+			if (text.trim()) lines.push("## Tool result", "", clampBlock(text), "");
+		} else {
+			const text = contentText(content as any);
+			if (text.trim()) lines.push(`## ${role}`, "", clampBlock(text), "");
+		}
+	}
+	return lines.join("\n");
+}
+
+/** Centralized scratch dir for full-context exports, following the
+ *  ~/.pi/extensions-data/<author>/<extension>/ convention (see pi-token-cost-ledger).
+ *  Derived from getAgentDir() so rebranded distros resolve correctly. */
+function askContextDir(): string {
+	return path.join(path.dirname(getAgentDir()), "extensions-data", "estebanforge", "pi-ask-codex");
+}
+
 // --- Extension -------------------------------------------------------------
 
 interface CodexDetails {
 	model: string | null;
 	resolvedModel: string | null;
+	reasoning: ReasoningEffort | null;
+	sandbox: SandboxMode | null;
 	sessionId: string | null;
+	includeContext: boolean;
 	exitCode: number;
 	aborted: boolean;
 	timedOut: boolean;
@@ -531,11 +607,20 @@ interface CodexDetails {
 	stderr: string;
 }
 
-function emptyDetails(model: string | null, resolvedModel: string | null): CodexDetails {
+function emptyDetails(
+	model: string | null,
+	resolvedModel: string | null,
+	reasoning: ReasoningEffort | null = null,
+	sandbox: SandboxMode | null = null,
+	includeContext: boolean = false,
+): CodexDetails {
 	return {
 		model,
 		resolvedModel,
+		reasoning,
+		sandbox,
 		sessionId: null,
+		includeContext,
 		exitCode: 0,
 		aborted: false,
 		timedOut: false,
@@ -718,7 +803,74 @@ export default async function (pi: ExtensionAPI) {
 					description: `Hard cap on the Codex run in minutes. Default ${DEFAULT_TIMEOUT_MIN}.`,
 				}),
 			),
+			includeContext: Type.Optional(
+				Type.Boolean({
+					description:
+						"When true, export the current pi conversation (resolved, as markdown) to a temp file inside the workspace and tell Codex to read it first. Default false (isolated one-shot). Opt in only when the user explicitly wants Codex to see the full conversation; it costs Codex tokens to read.",
+				}),
+			),
 		}),
+		renderCall(args, theme, _context) {
+			// Show RESOLVED model/reasoning/sandbox (config defaults applied) so
+			// the row identifies what will actually run, not just explicit args.
+			const cfg = loadConfig();
+			const model = (args.model as string | undefined)?.trim() || cfg.defaultModel;
+			const reasoning: ReasoningEffort = isReasoningEffort(args.reasoningEffort)
+				? args.reasoningEffort
+				: cfg.defaultReasoning;
+			const sandbox: SandboxMode = isSandboxMode(args.sandbox) ? args.sandbox : cfg.defaultSandbox;
+			const isContinue = typeof args.sessionId === "string" && SESSION_ID_RE.test(args.sessionId);
+
+			const tags: string[] = [`model=${model}`, `reasoning=${reasoning}`, `sandbox=${sandbox}`];
+			if (isContinue) tags.push("continue");
+			if (args.includeContext) tags.push("context=full");
+
+			let text = theme.fg("mdLink", theme.bold("AskCodex "));
+			text += `${theme.fg("accent", `[${tags.join(", ")}]`)} `;
+
+			const prompt = String(args.prompt ?? "");
+			const truncated = prompt.length > PREVIEW_MAX_CHARS ? prompt.slice(0, PREVIEW_MAX_CHARS) : prompt;
+			const lines = truncated.split("\n").slice(0, PREVIEW_MAX_LINES);
+			text += theme.fg("muted", `"${lines.join("\n")}"`);
+			if (prompt.length > PREVIEW_MAX_CHARS || prompt.split("\n").length > PREVIEW_MAX_LINES) {
+				text += theme.fg("dim", " …");
+			}
+			return new Text(text, 0, 0);
+		},
+		renderResult(result, { expanded, isPartial }, theme) {
+			const d = result.details as CodexDetails | undefined;
+			if (isPartial) {
+				const status = result.content[0]?.type === "text" ? result.content[0].text : "working...";
+				return new Text(theme.fg("mdLink", "◉ AskCodex ") + theme.fg("muted", status), 0, 0);
+			}
+
+			const body = result.content[0]?.type === "text" ? result.content[0].text : "";
+			const errored = d?.exitCode !== 0 || !!d?.aborted || !!d?.timedOut;
+
+			let text = errored
+				? theme.fg("error", "✗ AskCodex error")
+				: theme.fg("mdLink", "✓ AskCodex");
+
+			const rTags: string[] = [];
+			if (d?.resolvedModel || d?.model) rTags.push(`model=${d?.resolvedModel ?? d?.model}`);
+			if (d?.reasoning) rTags.push(`reasoning=${d.reasoning}`);
+			if (d?.sandbox) rTags.push(`sandbox=${d.sandbox}`);
+			if (d?.includeContext) rTags.push("context=full");
+			if (rTags.length) text += ` ${theme.fg("accent", `[${rTags.join(", ")}]`)}`;
+			if (d?.durationMs) text += ` ${theme.fg("dim", `${(d.durationMs / 1000).toFixed(1)}s`)}`;
+
+			if (expanded) {
+				if (body) text += `\n${theme.fg("toolOutput", body)}`;
+			} else {
+				const truncated = body.length > PREVIEW_MAX_CHARS ? body.slice(0, PREVIEW_MAX_CHARS) : body;
+				const lines = truncated.split("\n").slice(0, PREVIEW_MAX_LINES);
+				if (lines.length) text += `\n${theme.fg("toolOutput", lines.join("\n"))}`;
+				if (body.length > PREVIEW_MAX_CHARS || body.split("\n").length > PREVIEW_MAX_LINES) {
+					text += `\n${theme.fg("dim", `… (${keyHint("app.tools.expand", "to expand")})`)}`;
+				}
+			}
+			return new Text(text, 0, 0);
+		},
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			// Circular-delegation guard (best-effort). This extension registers
 			// NO provider, so the check only fires if a future codex-as-provider
@@ -775,6 +927,28 @@ export default async function (pi: ExtensionAPI) {
 
 			const start = Date.now();
 			const cwd = params.cwd || ctx.cwd || process.cwd();
+
+			// Opt-in full-context export (isolated stays the default).
+			let effectivePrompt = params.prompt;
+			let contextFile: string | null = null;
+			if (params.includeContext) {
+				try {
+					const { messages } = buildSessionContext(ctx.sessionManager.getBranch());
+					if (messages.length) {
+						const md = renderAgentMessagesMarkdown(messages);
+						const ctxDir = askContextDir();
+						fs.mkdirSync(ctxDir, { recursive: true });
+						contextFile = path.join(
+							ctxDir,
+							`.ask-context-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.md`,
+						);
+						fs.writeFileSync(contextFile, md, { mode: 0o600 });
+						effectivePrompt = `The full pi conversation context (as markdown) is at: ${contextFile}\nRead that file first for context, then do the task below.\n\n---\n\n${params.prompt}`;
+					}
+				} catch {
+					contextFile = null;
+				}
+			}
 
 			// Validate cwd up front for a clearer error than codex's.
 			try {
@@ -834,12 +1008,16 @@ export default async function (pi: ExtensionAPI) {
 			// task literally starting "--help" or "-v") is treated as the prompt
 			// positional, not a codex flag. Verified accepted in both fresh and
 			// resume modes (codex-cli 0.142.5).
-			args.push("--", params.prompt);
+			if (contextFile) args.push("--add-dir", askContextDir());
+			args.push("--", effectivePrompt);
 
 			const details: CodexDetails = {
 				model: requestedModel,
 				resolvedModel: resolved.flagValue,
+				reasoning,
+				sandbox,
 				sessionId: isContinuation ? (rawSessionId as string) : null,
+				includeContext: contextFile !== null,
 				exitCode: 0,
 				aborted: false,
 				timedOut: false,
@@ -1092,6 +1270,13 @@ export default async function (pi: ExtensionAPI) {
 					content: [{ type: "text", text: `failed to run codex: ${msg}` }],
 					details,
 				};
+			}
+			finally {
+				if (contextFile) {
+					try {
+						fs.unlinkSync(contextFile);
+					} catch {}
+				}
 			}
 		},
 	});

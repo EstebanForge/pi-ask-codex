@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.3] - 2026-08-13
+
+### Added
+
+- **Model, reasoning effort, and sandbox shown next to the tool name.**
+  While a delegation runs, the TUI now renders
+  `AskCodex [model=o4-mini, reasoning=high, sandbox=read-only]` with a
+  prompt preview, plus a tidy result row (`✓ AskCodex 12.3s`) with an
+  expandable body. Built on pi's `renderCall`/`renderResult` hooks; the
+  values shown are the resolved config defaults, not just the args the
+  caller passed. `CodexDetails` gained `reasoning` and `sandbox` fields.
+- **Opt-in full-context delegation (`includeContext`).** New boolean param
+  (default `false`, isolated one-shot unchanged). When `true`, the current pi
+  conversation is exported as resolved markdown to
+  `~/.pi/extensions-data/estebanforge/pi-ask-codex/` and the prompt tells
+  Codex to read it first. The run passes `--add-dir` for that folder so the
+  sandbox can read it; the temp file is removed after the run.
+
 ## [1.0.2] - 2026-08-06
 
 ### Changed
