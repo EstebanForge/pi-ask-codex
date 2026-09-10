@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.4] - 2026-09-10
+
+### Changed
+
+- **Default sandbox is now `danger-full-access` (was `workspace-write`).** Delegated Codex runs get unrestricted tool access with no approval prompts and no sandbox escalation failures (network or outside-workspace writes used to fail rather than ask under `workspace-write`), matching pi's own no-gate philosophy: pi's bash tool has neither sandbox nor gate. `workspace-write` (edit files in cwd only) and `read-only` (inspect without acting) remain per-call overrides or `defaultSandbox` in `~/.pi/agent/ask-codex.json`. The session-id UUID anchor and the model dash-guard are unchanged.
+
 ## [1.0.3] - 2026-08-13
 
 ### Added

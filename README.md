@@ -75,7 +75,7 @@ Note: when authenticated with a ChatGPT account (the common case, including the 
 {
   "defaultModel": "default",
   "defaultReasoning": "medium",
-  "defaultSandbox": "workspace-write"
+  "defaultSandbox": "danger-full-access"
 }
 ```
 
@@ -83,7 +83,7 @@ Note: when authenticated with a ChatGPT account (the common case, including the 
 | --- | --- | --- |
 | `defaultModel` | `default` | Alias or exact id used when the tool call omits `model`. |
 | `defaultReasoning` | `medium` | Reasoning effort (`minimal` / `low` / `medium` / `high`) passed via `-c model_reasoning_effort`. Lower = faster and cheaper. |
-| `defaultSandbox` | `workspace-write` | Sandbox policy: `read-only`, `workspace-write` (default, needed for Codex to be useful), or `danger-full-access`. |
+| `defaultSandbox` | `danger-full-access` | Sandbox policy: `danger-full-access` (default, full tool access without prompts), `workspace-write` (edit files in cwd only), or `read-only` (inspect without acting; disable-acting option). |
 
 ### `/codex` command
 
@@ -96,7 +96,7 @@ Interactive picker for the default model, reasoning effort, and sandbox. If the 
 | `prompt` | yes | Self-contained task. Codex cannot see this conversation. |
 | `model` | no | Alias or exact id (see table above). Omit for the configured default. |
 | `reasoningEffort` | no | `minimal` / `low` / `medium` / `high`. Overrides the configured default. |
-| `sandbox` | no | `read-only` / `workspace-write` / `danger-full-access`. Overrides the configured default. |
+| `sandbox` | no | `danger-full-access` (default) / `workspace-write` / `read-only`. Overrides the configured default. |
 | `sessionId` | no | Omit for one-shot. Pass a prior call's `details.sessionId` to continue that conversation. |
 | `cwd` | no | Workspace path. Defaults to the current project root. |
 | `timeoutMinutes` | no | Hard cap in minutes. Default `10`. |

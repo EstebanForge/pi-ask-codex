@@ -58,7 +58,10 @@ const PREVIEW_MAX_LINES = 6;
 
 const DEFAULT_MODEL = "default";
 const DEFAULT_REASONING = "medium";
-const DEFAULT_SANDBOX = "workspace-write";
+// Pi philosophy: pi's own bash tool has no sandbox and no approval gate, so
+// the delegation default matches: full tool access, no prompts. Restrict per
+// call (sandbox param) or via defaultSandbox in ask-codex.json when needed.
+const DEFAULT_SANDBOX = "danger-full-access";
 
 // codex session/thread ids are UUIDs (e.g. "0199a213-81c0-7800-8aa1-bbab2a035a53").
 // Anchored to UUID shape so a leading-dash value (e.g.
@@ -691,7 +694,7 @@ export default async function (pi: ExtensionAPI) {
 					id: "defaultSandbox",
 					label: "Default sandbox",
 					description:
-						"Codex sandbox policy. 'workspace-write' (default) lets Codex edit files; 'read-only' for inspection only; 'danger-full-access' unrestricted.",
+						"Codex sandbox policy. 'danger-full-access' (default) is unrestricted, full tool access without prompts; 'workspace-write' edits files in cwd only; 'read-only' inspects without acting.",
 					currentValue: config.defaultSandbox,
 					values: SANDBOX_OPTIONS,
 				},
@@ -789,7 +792,7 @@ export default async function (pi: ExtensionAPI) {
 			sandbox: Type.Optional(
 				StringEnum(SANDBOX_VALUES, {
 					description:
-						"Sandbox policy: 'read-only' (inspect, no writes), 'workspace-write' (edit files in cwd, default), 'danger-full-access' (unrestricted). Overrides the configured default.",
+						"Sandbox policy: 'danger-full-access' (default, unrestricted, no approval prompts), 'workspace-write' (edit files in cwd), 'read-only' (inspect, no writes). Overrides the configured default.",
 				}),
 			),
 			sessionId: Type.Optional(
